@@ -6,56 +6,59 @@ Fetches connectivity data and maps it into 2d, saving the results.
 
 import os
 from allensdk.core.mouse_connectivity_cache import MouseConnectivityCache
+from allensdk.core.structure_tree import StructureTree
 import numpy as np
 import h5py
 import time
 import nrrd
-from voxnet.conn2d import map_to_surface
+import ipdb
+import matplotlib.pyplot as plt
 from scipy.io import savemat
+from mcmodels.core.cortical_map import CorticalMap
 
-view_str = 'flatmap'
-drive_path = os.path.join(os.getenv('HOME'), 'work/allen/data/sdk_new_100')
-#output_dir = os.path.join(os.getenv('HOME'), 'work/allen/data/2d_test')
-output_dir = os.path.join(os.getenv('HOME'), 'work/allen/data/2d_test_flatmap')
-# view_paths_fn = os.path.join(os.getenv('HOME'),
-#                              'work/allen/data/TopView/top_view_paths_10.h5')
-view_paths_fn = os.path.join(os.getenv('HOME'),
-                       'work/allen/data/ccf_2017/dorsal_flatmap_paths_10.h5')
-# no_data = -1
-no_data = 0
+view_str = 'top_view'
+drive_path = os.path.join('../mouse_connectivity_models/connectivity')
+output_dir = os.path.join(os.getenv('HOME'), 'allen_get_connectivity_output')
+mapper = CorticalMap(projection='top_view')
+
+#Quick fix (removes holes in top_view)
+mapper.view_lookup[51, 69] = mapper.view_lookup[51, 68]
+mapper.view_lookup[51, 44] = mapper.view_lookup[51, 43]
+
+no_data = -1
+#no_data = 0
 
 # When downloading 3D connectivity data volumes, what resolution do you want
 # (in microns)?  
 # Options are: 10, 25, 50, 100
-resolution_um = 10
+resolution_um = 100
 
 # Drop list criterion, in percent difference
-volume_fraction = 30
+volume_fraction = 20
 
 # The manifest file is a simple JSON file that keeps track of all of
 # the data that has already been downloaded onto the hard drives.
 # If you supply a relative path, it is assumed to be relative to your
 # current working directory.
-manifest_file = os.path.join(drive_path, "manifest.json")
+manifest_file = os.path.join(drive_path, "mcmodels_manifest.json")
 
 # Start processing data
-mcc = MouseConnectivityCache(manifest_file=manifest_file,
-                             resolution=resolution_um)
-ontology = mcc.get_ontology()
+mcc = MouseConnectivityCache(manifest_file = manifest_file, resolution=resolution_um)
+                             
 # Injection structure of interest
-isocortex = ontology['Isocortex']
+isocortex = mcc.get_structure_tree().get_structures_by_name(['Isocortex'])
+isocortex_id = isocortex[0]['id']
 
-# open up a pandas dataframe of all of the experiments
+# Open up a pandas dataframe of all of the experiments
 experiments = mcc.get_experiments(dataframe=True, 
                                   injection_structure_ids=\
-                                      [isocortex['id'].values[0]], 
+                                      [isocortex[0]['id']], 
                                   cre=False)
-print "%d total experiments" % len(experiments)
+print("%d total experiments" % len(experiments))
 
-view_paths_file = h5py.File(view_paths_fn, 'r')
-view_lut = view_paths_file['view lookup'][:]
-view_paths = view_paths_file['paths'][:]
-view_paths_file.close()
+# Get lookup table from mapper
+view_lut = mapper.view_lookup[:]
+view_paths = mapper.paths[:]
 
 # Compute size of each path to convert path averages to sums
 norm_lut = np.zeros(view_lut.shape, dtype=int)
@@ -70,53 +73,68 @@ t0 = time.time()
 expt_drop_list = []
 full_vols = []
 flat_vols = []
-#eid = experiments.iloc[5].id
-#row = experiments.iloc[5]
+
+# Map injections and projections to 2D space
 for eid, row in experiments.iterrows():
-    print "\nProcessing experiment %d" % eid
-    print row
-    data_dir = os.path.join(os.getenv('HOME'),
-                            "work/allen/data/sdk_new_100/experiment_%d/" % eid)
+    print("\nProcessing experiment %d" % eid)
+    print(row)
+    
+    # Create path for experiment data to be saved
+    new_path = "../allen_sdk_experiments_topview"
+    if(os.path.exists(new_path) == False):
+        os.mkdir(new_path)
+    new_dir = "experiment_%d" % eid
+    data_dir = os.path.join(new_path, new_dir)
+    if(os.path.exists(data_dir) == False):
+        os.mkdir(data_dir)
+        
     # get and remap injection data
-    print "getting injection density"
+    print("getting injection density")
     in_d, in_info = mcc.get_injection_density(eid)
-    print "mapping to surface"
-    in_d_s = map_to_surface(in_d, view_lut, view_paths,
-                            scale=resolution_um/10., fun=np.mean,
-                            no_data=no_data)
+    
+    print("mapping to surface")
+    in_d_s  = mapper.transform(in_d,fill_value = np.nan)
+        
     flat_vol = np.nansum(in_d_s * norm_lut) * (10./1000.)**3
     flat_vols.append(flat_vol)
     full_vol = np.nansum(in_d) * (10./1000.)**3
     full_vols.append(full_vol)
-    print "flat_vol = %f\nfull_vol = %f" % (flat_vol, full_vol)
+    print("flat_vol = %f\nfull_vol = %f" % (flat_vol, full_vol))
+    
     # drop experiments without much injection volume
     if np.abs(flat_vol - full_vol) / full_vol * 100 > volume_fraction:
-        print "warning, placing experiment in drop list"
+        print ("warning, placing experiment in drop list")
         expt_drop_list.append(eid)
-    in_fn = data_dir + "injection_density_" + view_str + "_%d.nrrd" \
+            
+    in_fn = data_dir + "/injection_density_" + view_str + "_%d.nrrd" \
       % int(resolution_um)
-    print "writing " + in_fn
+    
+    print("writing " + in_fn)
     nrrd.write(in_fn, in_d_s)
+    
     # get and remap projection data
-    print "getting projection density"
+    print ("getting projection density")
     pr_d, pr_info = mcc.get_projection_density(eid)
-    print "mapping to surface"
-    pr_d_s = map_to_surface(pr_d, view_lut, view_paths,
-                            scale=resolution_um/10., fun=np.mean,
-                            no_data=no_data)
-    pr_fn = data_dir + "projection_density_" + view_str + "_%d.nrrd" \
+    
+    print ("mapping to surface")
+    pr_d_s  = mapper.transform(pr_d, fill_value = np.nan)
+    
+    pr_fn = data_dir + "/projection_density_" + view_str + "_%d.nrrd" \
       % int(resolution_um)
-    print "writing " + pr_fn
+    
+    print ("writing " + pr_fn)
     nrrd.write(pr_fn, pr_d_s)
 
 t1 = time.time()
 total = t1 - t0
-print "%0.1f minutes elapsed" % (total/60.)
-print "flat vols: " + str(flat_vols)
-print "full vols: " + str(full_vols)
-print "drop list: " + str(expt_drop_list)
+print ("%0.1f minutes elapsed" % (total/60.))
+print ("flat vols: " + str(flat_vols))
+print ("full vols: " + str(full_vols))
+print ("drop list: " + str(expt_drop_list))
 
-savemat(os.path.join(output_dir, 'volumes.mat'),
+#savemat(os.path.join(output_dir, view_str +'_get_conn_view_lut.mat'), {'view_lut' : view_lut})
+
+savemat(os.path.join(output_dir, view_str + '_volumes.mat'),
         {'flat_vols': flat_vols, 'full_vols': full_vols,
          'drop_list': expt_drop_list,
          'experiment_ids': np.array(experiments['id'])},
@@ -125,7 +143,6 @@ savemat(os.path.join(output_dir, 'volumes.mat'),
 
 # import matplotlib.pyplot as plt
 # plt.ion()
-
 # fig = plt.figure(figsize = (10,10))
 # ax = fig.add_subplot(121)
 # h = ax.imshow(in_d_s)
@@ -135,3 +152,5 @@ savemat(os.path.join(output_dir, 'volumes.mat'),
 # ax2 = fig.add_subplot(122)
 # h2 = ax2.imshow(pr_d_s)
 # #fig2.colorbar(h2)
+
+
